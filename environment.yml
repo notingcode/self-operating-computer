@@ -1,0 +1,7 @@
+name: self-op
+
+dependencies:
+  - python
+  - pip
+  - pip:
+      - -r requirements.txt
