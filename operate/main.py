@@ -3,7 +3,6 @@ Self-Operating Computer
 """
 import os
 import time
-import random
 import base64
 import json
 import math
@@ -13,6 +12,8 @@ import pyautogui
 import argparse
 import platform
 import Xlib.display
+import Xlib.X
+import Xlib.Xutil  # not sure if Xutil is necessary
 
 from prompt_toolkit import prompt
 from prompt_toolkit.shortcuts import message_dialog
@@ -32,6 +33,11 @@ client = OpenAI()
 client.api_key = os.getenv("OPENAI_API_KEY")
 client.base_url = os.getenv("OPENAI_API_BASE_URL", client.base_url)
 
+monitor_size = {
+    "width": 1920,
+    "height": 1080,
+}
+
 VISION_PROMPT = """
 You are a Self-Operating Computer. You use the same operating system as a human.
 
@@ -47,7 +53,8 @@ To operate the computer you have the four options below.
 Here are the response formats below.
 
 1. CLICK
-Response: CLICK {{ "x": "percent", "y": "percent", "description": "~description here~", "reason": "~reason here~" }}
+Response: CLICK {{ "x": "percent", "y": "percent", "description": "~description here~", "reason": "~reason here~" }} 
+Note that the percents work where the top left corner is "x": "0%" and "y": "0%" and the bottom right corner is "x": "100%" and "y": "100%"
 
 2. TYPE
 Response: TYPE "value you want to type"
@@ -89,26 +96,42 @@ IMPORTANT: Avoid repeating actions such as doing the same CLICK event twice in a
 Objective: {objective}
 """
 
+ACCURATE_PIXEL_COUNT = (
+    200  # mini_screenshot is ACCURATE_PIXEL_COUNT x ACCURATE_PIXEL_COUNT big
+)
+ACCURATE_MODE_VISION_PROMPT = """
+It looks like your previous attempted action was clicking on "x": {prev_x}, "y": {prev_y}. This has now been moved to the center of this screenshot.
+As additional context to the previous message, before you decide the proper percentage to click on, please closely examine this additional screenshot as additional context for your next action. 
+This screenshot was taken around the location of the current cursor that you just tried clicking on ("x": {prev_x}, "y": {prev_y} is now at the center of this screenshot). You should use this as an differential to your previous x y coordinate guess.
+
+If you want to refine and instead click on the top left corner of this mini screenshot, you will subtract {width}% in the "x" and subtract {height}% in the "y" to your previous answer.
+Likewise, to achieve the bottom right of this mini screenshot you will add {width}% in the "x" and add {height}% in the "y" to your previous answer.
+
+There are four segmenting lines across each dimension, divided evenly. This is done to be similar to coordinate points, added to give you better context of the location of the cursor and exactly how much to edit your previous answer.
+
+Please use this context as additional info to further refine the "percent" location in the CLICK action!
+"""
 
 USER_QUESTION = "Hello, I can help you with anything. What would you like done?"
 
 SUMMARY_PROMPT = """
-You are a Self-Operating Computer. You just completed a request from a user by operating the computer. Now you need to share the results.
+You are a Self-Operating Computer. A user request has been executed. Present the results succinctly.
 
-You have three pieces of key context about the completed request.
+Include the following key contexts of the completed request:
 
-1. The original objective
-2. The steps you took to reach the objective that are available in the previous messages
-3. The screenshot you are looking at.
+1. State the original objective.
+2. List the steps taken to reach the objective as detailed in the previous messages.
+3. Reference the screenshot that was used.
 
-Now you need to summarize what you did to reach the objective. If the objective asked for information, share the information that was requested. IMPORTANT: Don't forget to answer a user's question if they asked one.
+Summarize the actions taken to fulfill the objective. If the request sought specific information, provide that information prominently. NOTE: Address directly any question posed by the user.
 
-Thing to note: The user can not respond to your summary. You are just sharing the results of your work.
+Remember: The user will not interact with this summary. You are solely reporting the outcomes.
 
-The original objective was: {objective}
+Original objective: {objective}
 
-Now share the results!
+Display the results clearly:
 """
+
 
 
 class ModelNotRecognizedException(Exception):
@@ -172,10 +195,26 @@ else:
     ANSI_BRIGHT_MAGENTA = ""
 
 
-def main(model):
+def main(model, accurate_mode, voice_mode=False):
     """
     Main function for the Self-Operating Computer
     """
+    mic = None
+    # Initialize WhisperMic if voice_mode is True if voice_mode is True
+    """
+    Main function for the Self-Operating Computer
+    """
+    if voice_mode:
+        try:
+            from whisper_mic import WhisperMic
+
+            # Initialize WhisperMic if import is successful
+            mic = WhisperMic()
+        except ImportError:
+            print(
+                "Voice mode requires the 'whisper_mic' module. Please install it using 'pip install -r requirements-audio.txt'"
+            )
+            sys.exit(1)
 
     message_dialog(
         title="Self-Operating Computer",
@@ -184,18 +223,25 @@ def main(model):
     ).run()
 
     print("SYSTEM", platform.system())
-
+    # Clear the console
     if platform.system() == "Windows":
         os.system("cls")
     else:
         print("\033c", end="")
 
-    print(f"{ANSI_GREEN}[Self-Operating Computer]\n{ANSI_RESET}{USER_QUESTION}")
-    print(f"{ANSI_YELLOW}[User]{ANSI_RESET}")
-
-    objective = prompt(
-        style=style,
-    )
+    if voice_mode:
+        print(
+            f"{ANSI_GREEN}[Self-Operating Computer]{ANSI_RESET} Listening for your command... (speak now)"
+        )
+        try:
+            objective = mic.listen()
+        except Exception as e:
+            print(f"{ANSI_RED}Error in capturing voice input: {e}{ANSI_RESET}")
+            return  # Exit if voice input fails
+    else:
+        print(f"{ANSI_GREEN}[Self-Operating Computer]\n{ANSI_RESET}{USER_QUESTION}")
+        print(f"{ANSI_YELLOW}[User]{ANSI_RESET}")
+        objective = prompt(style=style)
 
     assistant_message = {"role": "assistant", "content": USER_QUESTION}
     user_message = {
@@ -210,7 +256,7 @@ def main(model):
         if DEBUG:
             print("[loop] messages before next action:\n\n\n", messages[1:])
         try:
-            response = get_next_action(model, messages, objective)
+            response = get_next_action(model, messages, objective, accurate_mode)
             action = parse_oai_response(response)
             action_type = action.get("type")
             action_detail = action.get("data")
@@ -292,9 +338,21 @@ def format_vision_prompt(objective, previous_action):
     return prompt
 
 
-def get_next_action(model, messages, objective):
+def format_accurate_mode_vision_prompt(prev_x, prev_y):
+    """
+    Format the accurate mode vision prompt
+    """
+    width = ((ACCURATE_PIXEL_COUNT / 2) / monitor_size["width"]) * 100
+    height = ((ACCURATE_PIXEL_COUNT / 2) / monitor_size["height"]) * 100
+    prompt = ACCURATE_MODE_VISION_PROMPT.format(
+        prev_x=prev_x, prev_y=prev_y, width=width, height=height
+    )
+    return prompt
+
+
+def get_next_action(model, messages, objective, accurate_mode):
     if model == "gpt-4-vision-preview":
-        content = get_next_action_from_openai(messages, objective)
+        content = get_next_action_from_openai(messages, objective, accurate_mode)
         return content
     elif model == "agent-1":
         return "coming soon"
@@ -316,7 +374,56 @@ def get_last_assistant_message(messages):
     return None  # Return None if no assistant message is found
 
 
-def get_next_action_from_openai(messages, objective):
+def accurate_mode_double_check(pseudo_messages, prev_x, prev_y):
+    """
+    Reprompt OAI with additional screenshot of a mini screenshot centered around the cursor for further finetuning of clicked location
+    """
+    try:
+        screenshot_filename = os.path.join("screenshots", "screenshot_mini.png")
+        capture_mini_screenshot_with_cursor(
+            file_path=screenshot_filename, x=prev_x, y=prev_y
+        )
+
+        new_screenshot_filename = os.path.join(
+            "screenshots", "screenshot_mini_with_grid.png"
+        )
+
+        with open(new_screenshot_filename, "rb") as img_file:
+            img_base64 = base64.b64encode(img_file.read()).decode("utf-8")
+
+        accurate_vision_prompt = format_accurate_mode_vision_prompt(prev_x, prev_y)
+
+        accurate_mode_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": accurate_vision_prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"},
+                },
+            ],
+        }
+
+        pseudo_messages.append(accurate_mode_message)
+
+        response = client.chat.completions.create(
+            model="gpt-4-vision-preview",
+            messages=pseudo_messages,
+            presence_penalty=1,
+            frequency_penalty=1,
+            temperature=0.7,
+            max_tokens=300,
+        )
+
+        content = response.choices[0].message.content
+
+        return content
+    except Exception as e:
+        print(f"Error reprompting model for accurate_mode: {e}")
+        return "ERROR"
+
+
+def get_next_action_from_openai(messages, objective, accurate_mode):
     """
     Get the next action for Self-Operating Computer
     """
@@ -356,6 +463,7 @@ def get_next_action_from_openai(messages, objective):
                 },
             ],
         }
+
         # create a copy of messages and save to pseudo_messages
         pseudo_messages = messages.copy()
         pseudo_messages.append(vision_message)
@@ -375,7 +483,25 @@ def get_next_action_from_openai(messages, objective):
                 "content": "`screenshot.png`",
             }
         )
+
         content = response.choices[0].message.content
+
+        if accurate_mode:
+            if content.startswith("CLICK"):
+                # Adjust pseudo_messages to include the accurate_mode_message
+
+                click_data = re.search(r"CLICK \{ (.+) \}", content).group(1)
+                click_data_json = json.loads(f"{{{click_data}}}")
+                prev_x = click_data_json["x"]
+                prev_y = click_data_json["y"]
+
+                if DEBUG:
+                    print(
+                        f"Previous coords before accurate tuning: prev_x {prev_x} prev_y {prev_y}"
+                    )
+                content = accurate_mode_double_check(pseudo_messages, prev_x, prev_y)
+                assert content != "ERROR", "ERROR: accurate_mode_double_check failed"
+
         return content
 
     except Exception as e:
@@ -443,7 +569,7 @@ def summarize(messages, objective):
         return content
 
     except Exception as e:
-        print(f"Error parsing JSON: {e}")
+        print(f"Error in summarize: {e}")
         return "Failed to summarize the workflow"
 
 
@@ -568,6 +694,8 @@ def search(text):
         pyautogui.press("space")
         pyautogui.keyUp("command")
 
+    time.sleep(1)
+
     # Now type the text
     for char in text:
         pyautogui.write(char)
@@ -576,7 +704,66 @@ def search(text):
     return "Open program: " + text
 
 
-def capture_screen_with_cursor(file_path=os.path.join("screenshots", "screenshot.png")):
+def capture_mini_screenshot_with_cursor(
+    file_path=os.path.join("screenshots", "screenshot_mini.png"), x=0, y=0
+):
+    user_platform = platform.system()
+
+    if user_platform == "Linux":
+        x = float(x[:-1])  # convert x from "50%" to 50.
+        y = float(y[:-1])
+
+        x = (x / 100) * monitor_size[
+            "width"
+        ]  # convert x from 50 to 0.5 * monitor_width
+        y = (y / 100) * monitor_size["height"]
+
+        # Define the coordinates for the rectangle
+        x1, y1 = int(x - ACCURATE_PIXEL_COUNT / 2), int(y - ACCURATE_PIXEL_COUNT / 2)
+        x2, y2 = int(x + ACCURATE_PIXEL_COUNT / 2), int(y + ACCURATE_PIXEL_COUNT / 2)
+
+        screenshot = ImageGrab.grab(bbox=(x1, y1, x2, y2))
+        screenshot = screenshot.resize(
+            (screenshot.width * 2, screenshot.height * 2), Image.LANCZOS
+        )  # upscale the image so it's easier to see and percentage marks more visible
+        screenshot.save(file_path)
+
+        screenshots_dir = "screenshots"
+        grid_screenshot_filename = os.path.join(
+            screenshots_dir, "screenshot_mini_with_grid.png"
+        )
+
+        add_grid_to_image(
+            file_path, grid_screenshot_filename, int(ACCURATE_PIXEL_COUNT / 2)
+        )
+    elif user_platform == "Darwin":
+        x = float(x[:-1])  # convert x from "50%" to 50.
+        y = float(y[:-1])
+
+        x = (x / 100) * monitor_size[
+            "width"
+        ]  # convert x from 50 to 0.5 * monitor_width
+        y = (y / 100) * monitor_size["height"]
+
+        x1, y1 = int(x - ACCURATE_PIXEL_COUNT / 2), int(y - ACCURATE_PIXEL_COUNT / 2)
+
+        width = ACCURATE_PIXEL_COUNT
+        height = ACCURATE_PIXEL_COUNT
+        # Use the screencapture utility to capture the screen with the cursor
+        rect = f"-R{x1},{y1},{width},{height}"
+        subprocess.run(["screencapture", "-C", rect, file_path])
+
+        screenshots_dir = "screenshots"
+        grid_screenshot_filename = os.path.join(
+            screenshots_dir, "screenshot_mini_with_grid.png"
+        )
+
+        add_grid_to_image(
+            file_path, grid_screenshot_filename, int(ACCURATE_PIXEL_COUNT / 2)
+        )
+
+
+def capture_screen_with_cursor(file_path):
     user_platform = platform.system()
 
     if user_platform == "Windows":
@@ -586,6 +773,8 @@ def capture_screen_with_cursor(file_path=os.path.join("screenshots", "screenshot
         # Use xlib to prevent scrot dependency for Linux
         screen = Xlib.display.Display().screen()
         size = screen.width_in_pixels, screen.height_in_pixels
+        monitor_size["width"] = size[0]
+        monitor_size["height"] = size[1]
         screenshot = ImageGrab.grab(bbox=(0, 0, size[0], size[1]))
         screenshot.save(file_path)
     elif user_platform == "Darwin":  # (Mac OS)
@@ -635,9 +824,23 @@ def main_entry():
         default="gpt-4-vision-preview",
     )
 
+    # Add a voice flag
+    parser.add_argument(
+        "--voice",
+        help="Use voice input mode",
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "-accurate",
+        help="Activate Reflective Mouse Click Mode",
+        action="store_true",
+        required=False,
+    )
+
     try:
         args = parser.parse_args()
-        main(args.model)
+        main(args.model, accurate_mode=args.accurate, voice_mode=args.voice)
     except KeyboardInterrupt:
         print(f"\n{ANSI_BRIGHT_MAGENTA}Exiting...")
 
