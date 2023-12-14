@@ -1,7 +1,8 @@
 name: self-op
 
 dependencies:
-  - python
+  - python=3.9
   - pip
   - pip:
       - -r requirements.txt
+      - -r requirements-audio.txt
